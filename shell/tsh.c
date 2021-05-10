@@ -40,7 +40,7 @@ extern char **environ;      /* defined in libc */
 char prompt[] = "tsh> ";    /* command line prompt (DO NOT CHANGE) */
 int verbose = 0;            /* if true, print additional output */
 int nextjid = 1;            /* next job ID to allocate */
-char sbuf[MAXLINE];         /* for composing sprintf messages */
+char sbuf[MAXLINE+100];         /* for composing sprintf messages */
 
 struct job_t {              /* The job struct */
     pid_t pid;              /* job PID */
@@ -151,7 +151,84 @@ int main(int argc, char **argv)
 
     exit(0); /* control never reaches here */
 }
-  
+
+/* Fork wrapper */
+pid_t Fork(void) {
+    pid_t pid;
+    if ((pid = fork()) < 0)
+        unix_error("Fork error");
+    return pid;
+}
+
+/* Execve wrapper */
+void Execve(const char *filename, char *const argv[], char *const envp[]) 
+{
+    if (execve(filename, argv, envp) < 0) {
+        printf("%s: Command not found\n", filename);
+        exit(1);
+    }
+}
+
+/* Kill wrapper */
+void Kill(pid_t pid, int signum) 
+{
+    int rc;
+
+    if ((rc = kill(pid, signum)) < 0)
+	unix_error("Kill error");
+}
+
+/* wrappers about signal */
+void Sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+    if (sigprocmask(how, set, oldset) < 0)
+	unix_error("Sigprocmask error");
+    return;
+}
+
+void Sigemptyset(sigset_t *set)
+{
+    if (sigemptyset(set) < 0)
+	unix_error("Sigemptyset error");
+    return;
+}
+
+void Sigfillset(sigset_t *set)
+{ 
+    if (sigfillset(set) < 0)
+	unix_error("Sigfillset error");
+    return;
+}
+
+void Sigaddset(sigset_t *set, int signum)
+{
+    if (sigaddset(set, signum) < 0)
+	unix_error("Sigaddset error");
+    return;
+}
+
+/* IO */
+static size_t sio_strlen(char s[])
+{
+    int i = 0;
+
+    while (s[i] != '\0')
+        ++i;
+    return i;
+}
+
+ssize_t sio_puts(char s[]) /* Put string */
+{
+    return write(STDOUT_FILENO, s, sio_strlen(s)); //line:csapp:siostrlen
+}
+
+void sio_error(char s[]) /* Put error message and exit */
+{
+    sio_puts(s);
+    _exit(1);                                      //line:csapp:sioexit
+}
+
+
 /* 
  * eval - Evaluate the command line that the user has just typed in
  * 
@@ -165,6 +242,45 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+    char *argv[MAXARGS];
+    char buf[MAXLINE];
+    char temp_buf[MAXLINE];
+    int bg;
+    int jid;
+    pid_t pid;
+
+    strcpy(buf, cmdline);
+    bg = parseline(buf, argv);  /* parse buf to argv */
+    if (argv[0] == NULL)
+        return; /* ignore blanks */
+    
+    if (builtin_cmd(argv)) {
+        return;
+    }
+    
+    sigset_t mask_all, mask_one, prev_one;
+    Sigfillset(&mask_all);
+    Sigemptyset(&mask_one);
+    Sigaddset(&mask_one, SIGCHLD); /* only SIGCHLD */
+
+    Sigprocmask(SIG_BLOCK, &mask_one, &prev_one); /* Block SIGCHLD */
+    if ((pid = Fork()) == 0) { /* create child process */
+        Sigprocmask(SIG_SETMASK, &prev_one, NULL); /* Unblock SIGCHLD in child */
+        setpgid(0, 0);
+        Execve(argv[0], argv, environ);
+    }
+
+    Sigprocmask(SIG_BLOCK, &mask_all, NULL); /* Block all */
+    addjob(jobs, pid, 1+bg, cmdline); /* Add the child to the job list */
+    jid = getjobpid(jobs, pid)->jid;
+    Sigprocmask(SIG_SETMASK, &prev_one, NULL);  /* Unblock SIGCHLD in parent */
+    
+    if (bg) {
+        sprintf(temp_buf, "[%d] (%d) %s", jid, pid, buf);
+        sio_puts(temp_buf);
+    } else {
+        waitfg(pid);
+    }
     return;
 }
 
@@ -231,6 +347,26 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+    sigset_t mask_all, prev_all;
+    Sigfillset(&mask_all);
+    if (!strcmp(argv[0], "quit")) {
+        exit(0);
+    }
+
+    if (!strcmp(argv[0], "fg") || !strcmp(argv[0], "bg")) {
+        do_bgfg(argv);
+        return 1;
+    }
+
+    if (!strcmp(argv[0], "jobs")) {
+        Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        listjobs(jobs);
+        Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+        return 1;
+    }
+        
+    if (!strcmp(argv[0], "&")) /* ignore command line that only contain a & */
+        return 1;
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +375,63 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    int j = 0;
+    int jid = 0;
+    pid_t pid = 0;
+    struct job_t* job;
+    sigset_t mask_all, prev_all;
+
+    if (!argv[1]) {
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+
+    if (argv[1][0] == '%') {
+        j = 1;
+    }
+
+    if (argv[1][j] < '0' || argv[1][j] > '9') {
+        printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+        return;
+    }
+
+    Sigfillset(&mask_all);
+    Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+    if (argv[1][0] == '%') {
+        jid = atoi(argv[1]+1);
+        job = getjobjid(jobs, jid);
+        if (!job) {
+            printf("%s: No such job\n", argv[1]);
+            Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+            return;
+        }
+        pid = job->pid;
+    } else {
+        pid = atoi(argv[1]);
+        job = getjobpid(jobs, jid);
+        if (!job) {
+            printf("(%d): No such process\n", pid);
+            Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+            return;
+        }
+        jid = job->jid;
+    }
+
+    if (!strcmp(argv[0], "bg")) {
+        job->state = BG;
+        sprintf(sbuf, "[%d] (%d) %s", jid, pid, job->cmdline);
+        sio_puts(sbuf);
+    } else {
+        job->state = FG;
+    }
+    
+    Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+
+    Kill(-pid, SIGCONT);
+    if (!strcmp(argv[0], "fg")) {
+        waitfg(pid);
+    }
+
     return;
 }
 
@@ -247,6 +440,20 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+    sigset_t mask_all, prev_all;
+    char temp_buf[MAXLINE];
+    pid_t fg_pid = pid;
+    while (fg_pid == pid) {
+        Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        sigsuspend(&prev_all);
+        fg_pid = fgpid(jobs);
+        // sigsuspend(&prev_all);
+        Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    }
+    if (verbose) {
+        sprintf(temp_buf, "waitfg: Process (%d) no longer the fg process\n", pid);
+        sio_puts(temp_buf);
+    }
     return;
 }
 
@@ -263,6 +470,58 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+    int olderrno = errno;
+    int status;
+    int jid;
+    pid_t pid;
+    struct job_t* job;
+    sigset_t mask_all, prev_all;
+
+    if (verbose)
+        sio_puts("sigchld_handler: entering\n");
+
+    Sigfillset(&mask_all);
+    while ((pid = waitpid(-1, &status, WUNTRACED | WNOHANG)) > 0) {
+        Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+        job = getjobpid(jobs, pid);
+        jid = job->jid;
+            
+        
+        if (WIFSTOPPED(status)) { // temporarily stopped by ctrl + z (SIGTSTP)
+            sprintf(sbuf, "Job [%d] (%d) stopped by signal %d\n", jid, pid, WSTOPSIG(status));
+            sio_puts(sbuf);
+            job->state = ST;
+        } else {
+            deletejob(jobs, pid);
+            
+            if (verbose) {
+                sprintf(sbuf, "sigchld_handler: Job [%d] (%d) deleted\n", jid, pid);
+                sio_puts(sbuf);
+            }
+
+            if (WIFEXITED(status)) { // terminated normally
+                if (verbose) {
+                    sprintf(sbuf, "sigchld_handler: Job [%d] (%d) terminates OK (status 0)\n", jid, pid);
+                    sio_puts(sbuf);
+                }
+            }
+
+            if (WIFSIGNALED(status)) { // terminated by ctrl + c (SIGINT)
+                sprintf(sbuf, "Job [%d] (%d) terminated by signal %d\n", jid, pid, WTERMSIG(status));
+                sio_puts(sbuf);
+            }
+        }
+        
+        Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    }
+    if (pid && errno != ECHILD) {
+        sio_puts(strerror(errno));
+        sio_error("waitpid error"); 
+    }
+    
+    if (verbose)
+        sio_puts("sigchld_handler: exiting\n");
+    errno = olderrno;
     return;
 }
 
@@ -273,6 +532,25 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    sigset_t mask_all, prev_all;
+    pid_t fg_pid;
+
+    if (verbose)
+        sio_puts("sigint_handler: entering\n");
+    Sigfillset(&mask_all);
+    Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+    fg_pid = fgpid(jobs);
+    if (verbose) {
+        sprintf(sbuf, "sigint_handler: Job (%d) killed\n", fg_pid);
+        sio_puts(sbuf);
+    }
+    Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    
+    if (fg_pid > 0)
+        Kill(-fg_pid, sig);
+    
+    if (verbose)
+        sio_puts("sigint_handler: exiting\n");
     return;
 }
 
@@ -283,6 +561,33 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    sigset_t mask_all, prev_all;
+    pid_t fg_pid;
+    struct job_t* job;
+    int jid;
+    if (verbose)
+        sio_puts("sigtstp_handler: entering\n");
+    Sigfillset(&mask_all);
+    Sigprocmask(SIG_BLOCK, &mask_all, &prev_all);
+    fg_pid = fgpid(jobs);
+    job = getjobpid(jobs, fg_pid);
+    if (!job) {
+        if (verbose)
+            sio_puts("sigtstp_handler: exiting\n");
+        return;
+    } 
+    jid = job->jid;
+    // job->state = ST;
+    if (verbose) {
+        sprintf(sbuf, "sigtstp_handler: Job [%d] (%d) stopped\n", jid, fg_pid);
+        sio_puts(sbuf);
+    }
+    Sigprocmask(SIG_SETMASK, &prev_all, NULL);
+    if (fg_pid > 0)
+        Kill(-fg_pid, sig);
+    
+    if (verbose)
+        sio_puts("sigtstp_handler: exiting\n");
     return;
 }
 
@@ -325,7 +630,8 @@ int maxjid(struct job_t *jobs)
 int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline) 
 {
     int i;
-    
+    char temp_buf[MAXLINE];
+
     if (pid < 1)
         return 0;
 
@@ -338,7 +644,8 @@ int addjob(struct job_t *jobs, pid_t pid, int state, char *cmdline)
                 nextjid = 1;
             strcpy(jobs[i].cmdline, cmdline);
             if (verbose) {
-                printf("Added job [%d] %d %s\n", jobs[i].jid, jobs[i].pid, jobs[i].cmdline);
+                sprintf(temp_buf, "Added job [%d] %d %s\n", jobs[i].jid, jobs[i].pid, jobs[i].cmdline);
+                sio_puts(temp_buf);
             }
             return 1;
         }
