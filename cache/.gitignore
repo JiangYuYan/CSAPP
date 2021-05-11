@@ -5,3 +5,4 @@ tracegen
 trace.*
 .csim_results
 .marker
+*.txt
